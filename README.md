@@ -72,7 +72,7 @@ python train_socc.py --shapepath data/Faust/real_11/   --device 0 --exp_dir expe
 
 To evaluate the trained model, run the following command:
 ```bash
-python eval.py --config config.json --device 0 --shapename <shapename> --results_dir results/
+python eval.py  --device 0 --shapename <shapename> --results_dir results/
 ```
 This will evaluate the model on the test set and store the results in the `results` directory.
 
