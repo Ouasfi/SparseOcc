@@ -10,9 +10,16 @@ from scipy.spatial import cKDTree
 import mcubes
 from pyhocon import ConfigFactory
 import wandb
-
-
+import napf
+from scipy.spatial import cKDTree as KDTree
+import torch
+from torch.autograd import grad
 def fix_seeds():
+    """
+    Fix the seeds of numpy, torch and random to ensure reproducibility across
+    different runs. This is useful when you want to compare the results of
+    different experiments, or when you want to reproduce the results of a paper.
+    """
     torch.use_deterministic_algorithms(False)
     torch.backends.cudnn.deterministic = True
     np.random.seed(0)
@@ -33,6 +40,13 @@ def load_conf(path):
     return ConfigFactory.parse_string(conf_text)
 
 def load_pointcloud(datapath):
+    """
+    params:
+    ------
+    datapath: path to the data directory
+    
+    returns a dict containing the points, occupancy grid, pointcloud, and normals.
+    """
     try: 
         dataspace = np.load(datapath + 'points.npz')
         points_tgt = dataspace['points'].astype(np.float32)
@@ -55,10 +69,11 @@ def load_pointcloud(datapath):
     return data
 
 def sample_pointcloud(data, N):
+ 
     """
     params:
     ------
-    data: dict containing points and normals.
+    data: dict containing pc,  normals.
     N : int number of points to sample.
     
     returns sampled points and normals
@@ -92,6 +107,14 @@ def sample_pointcloud_srb(data, N):
     points = points / scale
 
     return points, normals, (cp, scale)
+
+def sample_uniform_points(boxsize = 1.01, n_points_uniform = 5000):
+    points_padding = 0.01
+
+    #boxsize = 1 + points_padding
+    points_uniform = torch.rand(n_points_uniform, 3, device = 'cuda')
+    points_uniform = boxsize * (points_uniform - 0.5)
+    return points_uniform
 def add_gaussian_noise(points, sigma ):
     """
     params:
@@ -116,16 +139,23 @@ def sample_shape(path, classe):
     rng = np.random.default_rng( scr ) 
     return rng.choice(glob.glob(path + classe + '/*/'))
 
-def np_train_data(point, sample, batch_size, device = 'cuda'):
-    index_coarse = np.random.choice(10, 1)
-    index_fine = np.random.choice((sample.shape[0]-1)//10 , batch_size, replace = False)
-    index = index_fine * 10 + index_coarse
-    points = point[index]#.unsqueeze(0)
-    samples = sample[index]#.unsqueeze(0)
-    return points.to(device), samples.to(device), index
 
 def get_sigmas(noisy_data):
     
+    """
+    Compute the local sigmas for a given noisy pointcloud.
+    
+    The local sigmas are computed as the distance to the 50th nearest neighbor of each point in the pointcloud.
+    
+    Parameters
+    ----------
+    noisy_data : torch Tensor of shape (N, 3)
+        The noisy pointcloud.
+    
+    Returns
+    -------
+    local_sigma : torch Tensor of shape (N) containing the local sigmas.
+    """
     sigma_set = []
 
     ptree = cKDTree(noisy_data)
@@ -138,20 +168,15 @@ def get_sigmas(noisy_data):
     local_sigma = torch.from_numpy(sigmas).float().cuda()
     return local_sigma
 def fast_process_data(pointcloud, n_queries = 1):
-    """
-    params:
-    ------
-    pointcloud: input pointcloud.
-    
-    returns a dict containing query points sampled around the input and their corresponding nearst neighbors.
-    """
+ 
+
     dim = pointcloud.shape[-1]
     scr = 183965288784846061718375689149290307792 #secrets.randbits(128)
     rng = np.random.default_rng( scr ) 
     pointcloud_ = pointcloud 
     POINT_NUM, POINT_NUM_GT,  = pointcloud.shape[0] // 60 , pointcloud.shape[0] // 60 * 60 
     QUERY_EACH = int(n_queries*1000000//POINT_NUM_GT)
-    print(POINT_NUM,POINT_NUM_GT,QUERY_EACH)
+    #print(POINT_NUM,POINT_NUM_GT,QUERY_EACH)
     scale = 0.25 * np.sqrt(POINT_NUM_GT / 20000)
     # Subsample to n_points_gt
     point_idx = rng.choice(pointcloud.shape[0], POINT_NUM_GT, replace = False)
@@ -166,39 +191,123 @@ def fast_process_data(pointcloud, n_queries = 1):
             'sample_near' : sample_near, 'idx': point_idx, 'rho_idx': n_idx}
 
 
-import napf
-def compute_dists_flann(recon_points, gt_points):
-    recon_kd_tree = napf.KDT(tree_data=recon_points, metric=2) 
-    gt_kd_tree = napf.KDT(tree_data=gt_points, metric=2)
-    re2gt_distances, indices = recon_kd_tree.knn_search(
-                            queries=gt_points,
-                            kneighbors=1,
-                            nthread=50)
-    gt2re_distances, indices = gt_kd_tree.knn_search(
-                            queries=recon_points,
-                            kneighbors=1,
-                            nthread=50)
+def build_dataset_srb(shapepath:str, n_points:int, sigma:float, n_queries = 1 ):
+    """
+    sample the input pointcloud and the supervision points
+    params:
+    ------
+    shapepath: path to the pointcloud npz file
+    n_points: size of the input pointcloud
+    sigma: level of noise to apply to the pointcloud    
+    """
+    shapedata = load_pointcloud(shapepath)
+    points_clean, normals, (cp, scale) = sample_pointcloud_srb(shapedata, N = n_points)
+    noisy_points = add_gaussian_noise(points_clean, sigma )
+    shapedata['cp'], shapedata['scale'] = (cp, scale)
+    datanp = fast_process_data(noisy_points,n_queries)
+    np_point = np.asarray(datanp['sample_near']).reshape(-1,3)
+    point = torch.from_numpy( np.asarray(datanp['sample_near']).reshape(-1,3) ).to(torch.float32)#.to(device)
+    sample = torch.from_numpy( np.asarray(datanp['sample']).reshape(-1,3) ).to(torch.float32)#.to(device)
+    bound_min = np.array([np.min(np_point[:,0]), np.min(np_point[:,1]), np.min(np_point[:,2])]) -0.05
+    bound_max = np.array([np.max(np_point[:,0]), np.max(np_point[:,1]), np.max(np_point[:,2])]) +0.05
+    return shapedata, datanp, noisy_points, (bound_min, bound_max), point, sample
+
+def build_dataset(shapepath:str, n_points:int, sigma:float, n_queries = 1 ):
+    """
+    sample the input pointcloud and the supervision points
+    params:
+    ------
+    shapepath: path to the pointcloud npz file
+    n_points: size of the input pointcloud
+    sigma: level of noise to apply to the pointcloud    
+    """
+    shapedata = load_pointcloud(shapepath)
+    points_clean, normals = sample_pointcloud(shapedata, N = n_points)
+    noisy_points = add_gaussian_noise(points_clean, sigma )
+
+    datanp = fast_process_data(noisy_points,n_queries)
+    np_point = np.asarray(datanp['sample_near']).reshape(-1,3)
+    point = torch.from_numpy( np.asarray(datanp['sample_near']).reshape(-1,3) ).to(torch.float32)#.to(device)
+    sample = torch.from_numpy( np.asarray(datanp['sample']).reshape(-1,3) ).to(torch.float32)#.to(device)
+    bound_min = np.array([np.min(np_point[:,0]), np.min(np_point[:,1]), np.min(np_point[:,2])]) -0.05
+    bound_max = np.array([np.max(np_point[:,0]), np.max(np_point[:,1]), np.max(np_point[:,2])]) +0.05
+    return shapedata, datanp, noisy_points, (bound_min, bound_max), point, sample
+
+def np_train_data(point, sample, batch_size, device = 'cuda'):
+    """
+    params:
+    ------
+    point: torch tensor of shape (N,3) containing the points of the input pointcloud.
+    sample: torch tensor of shape (N,3) containing the query points.
+    batch_size: int, batch size for the sampled points.
+    device: str, device to move the points and samples to.
     
-    re2gt_distances = np.sqrt(re2gt_distances)
-    gt2re_distances = np.sqrt(gt2re_distances)
-    cd_re2gt = np.mean(re2gt_distances)
-    cd_gt2re = np.mean(gt2re_distances)
-    hd_re2gt = np.max(re2gt_distances)
-    hd_gt2re = np.max(gt2re_distances)
-    chamfer_dist = 0.5* (cd_re2gt + cd_gt2re)
-    hausdorff_distance = np.max((hd_re2gt, hd_gt2re))
-    return chamfer_dist , hausdorff_distance
+    returns points, samples, index: torch tensors of shape (B,3), (B,3), (B) and the index of the sampled points.
+    """
+    index_coarse = np.random.choice(10, 1)
+    index_fine = np.random.choice((sample.shape[0]-1)//10 , batch_size, replace = False)
+    index = index_fine * 10 + index_coarse
+    points = point[index]#.unsqueeze(0)
+    samples = sample[index]#.unsqueeze(0)
+    return points.to(device), samples.to(device), index
 
-def validate_mesh(bound_min,bound_max,query_func,  resolution=64, threshold=0.0, point_gt=None, iter_step=0, logger=None,N_val = 100000, compute_dist_fn=compute_dists_flann ):
-    #N_val = 100000
+def init_wandb( name = "Baseline", config= {}):
+    wandb.init(
+        # set the wandb project where this run will be logged
+        project="neural_pull",
+        name = name,
+        # track hyperparameters and run metadata
+        config=config
+    )
 
-    bound_min = torch.tensor(bound_min, dtype=torch.float32)
-    bound_max = torch.tensor(bound_max, dtype=torch.float32)
-    mesh = extract_geometry(bound_min, bound_max, resolution=resolution, threshold=threshold, 
-                            query_func=query_func)
-    recon_points = mesh.sample(N_val)
-    cd1, hd = compute_dist_fn(point_gt, recon_points)
-    return cd1, hd, mesh,recon_points
+
+def pull_points (sdf_network, samples, alpha = 1.):
+    """
+    pull points towards the surface using the sdf of the network and it's gradient
+    """
+    gradients_sample = sdf_network.gradient(samples).squeeze() # 5000x3
+    sdf_sample = sdf_network.sdf(samples)                      # 5000x1
+    grad_norm = F.normalize(gradients_sample, dim=1)                # 5000x3
+    sample_moved = samples -alpha* grad_norm * sdf_sample
+    return sample_moved
+
+def gradient(inputs, outputs):
+    d_points = torch.ones_like(outputs, requires_grad=False, device=outputs.device)
+    points_grad = grad(
+        outputs=outputs,
+        inputs=inputs,
+        grad_outputs=d_points,
+        create_graph=True,
+        retain_graph=True,
+        only_inputs=True)[0]
+    return points_grad
+def get_exp(args):
+    return f'{args.method}_p_{args.n_points}_sigma_{args.sigma}_rho_{args.rho}'
+
+class Scheduler:
+    def __init__(self, optimizer, maxiter, learning_rate, warm_up_end):
+        self.warm_up_end = warm_up_end
+        self.maxiter = maxiter
+        self.learning_rate = learning_rate
+        self.optimizer = optimizer
+    def get_lr(self, iter_step):
+        warn_up = self.warm_up_end
+        max_iter = self.maxiter
+        init_lr = self.learning_rate
+        lr =  (iter_step / warn_up) if iter_step < warn_up else 0.5 * (math.cos((iter_step - warn_up)/(max_iter - warn_up) * math.pi) + 1) 
+        lr = lr * init_lr
+        return lr
+    def update_learning_rate_np(self, iter_step):
+        warn_up = self.warm_up_end
+        max_iter = self.maxiter
+        init_lr = self.learning_rate
+        lr =  (iter_step / warn_up) if iter_step < warn_up else 0.5 * (math.cos((iter_step - warn_up)/(max_iter - warn_up) * math.pi) + 1) 
+        lr = lr * init_lr
+        for g in self.optimizer.param_groups:
+            g['lr'] = lr
+
+
+
 def extract_fields( bound_min, bound_max, resolution, query_func):
     N = 32
     X = torch.linspace(bound_min[0], bound_max[0], resolution).split(N)
@@ -228,7 +337,16 @@ def extract_geometry( bound_min, bound_max, resolution, threshold, query_func):
 
     return mesh
 
-from scipy.spatial import cKDTree as KDTree
+def validate_mesh(bound_min,bound_max,query_func,  resolution=64, threshold=0.0, point_gt=None, iter_step=0, logger=None,N_val = 100000, compute_dist_fn=compute_dists_flann ):
+    #N_val = 100000
+
+    bound_min = torch.tensor(bound_min, dtype=torch.float32)
+    bound_max = torch.tensor(bound_max, dtype=torch.float32)
+    mesh = extract_geometry(bound_min, bound_max, resolution=resolution, threshold=threshold, 
+                            query_func=query_func)
+    recon_points = mesh.sample(N_val)
+    cd1, hd = compute_dist_fn(point_gt, recon_points)
+    return cd1, hd, mesh,recon_points
 def compute_dists(recon_points, gt_points):
     recon_kd_tree = KDTree(recon_points)
     gt_kd_tree = KDTree(gt_points)
@@ -242,113 +360,27 @@ def compute_dists(recon_points, gt_points):
     chamfer_dist = 0.5* (cd_re2gt + cd_gt2re)
     hausdorff_distance = np.max((hd_re2gt, hd_gt2re))
     return chamfer_dist , hausdorff_distance
-
-def build_dataset_srb(shapepath:str, n_points:int, sigma:float, n_queries = 1 ):
-    """
-    sample the input pointcloud and the supervision points
-    params:
-    ------
-    shapepath: path to the pointcloud npz file
-    n_points: size of the input pointcloud
-    sigma: level of noise to apply to the pointcloud    
-    """
-    shapedata = load_pointcloud(shapepath)
-    points_clean, normals, (cp, scale) = sample_pointcloud_srb(shapedata, N = n_points)
-    noisy_points = add_gaussian_noise(points_clean, sigma )
-    shapedata['cp'], shapedata['scale'] = (cp, scale)
-    datanp = fast_process_data(noisy_points,n_queries)
-    np_point = np.asarray(datanp['sample_near']).reshape(-1,3)
-    point = torch.from_numpy( np.asarray(datanp['sample_near']).reshape(-1,3) ).to(torch.float32)#.to(device)
-    sample = torch.from_numpy( np.asarray(datanp['sample']).reshape(-1,3) ).to(torch.float32)#.to(device)
-    bound_min = np.array([np.min(np_point[:,0]), np.min(np_point[:,1]), np.min(np_point[:,2])]) -0.05
-    bound_max = np.array([np.max(np_point[:,0]), np.max(np_point[:,1]), np.max(np_point[:,2])]) +0.05
-    return shapedata, datanp, noisy_points, (bound_min, bound_max), point, sample
-
-
-def build_dataset(shapepath:str, n_points:int, sigma:float, n_queries = 1 ):
-    """
-    sample the input pointcloud and the supervision points
-    params:
-    ------
-    shapepath: path to the pointcloud npz file
-    n_points: size of the input pointcloud
-    sigma: level of noise to apply to the pointcloud    
-    """
-    shapedata = load_pointcloud(shapepath)
-    points_clean, normals = sample_pointcloud(shapedata, N = n_points)
-    noisy_points = add_gaussian_noise(points_clean, sigma )
-
-    datanp = fast_process_data(noisy_points,n_queries)
-    np_point = np.asarray(datanp['sample_near']).reshape(-1,3)
-    point = torch.from_numpy( np.asarray(datanp['sample_near']).reshape(-1,3) ).to(torch.float32)#.to(device)
-    sample = torch.from_numpy( np.asarray(datanp['sample']).reshape(-1,3) ).to(torch.float32)#.to(device)
-    bound_min = np.array([np.min(np_point[:,0]), np.min(np_point[:,1]), np.min(np_point[:,2])]) -0.05
-    bound_max = np.array([np.max(np_point[:,0]), np.max(np_point[:,1]), np.max(np_point[:,2])]) +0.05
-    return shapedata, datanp, noisy_points, (bound_min, bound_max), point, sample
-
-def init_wandb( name = "Baseline", config= {}):
-    wandb.init(
-        # set the wandb project where this run will be logged
-        project="neural_pull",
-        name = name,
-        # track hyperparameters and run metadata
-        config=config
-    )
-def sample_uniform_points(boxsize = 1.01, n_points_uniform = 5000):
-    points_padding = 0.01
-
-    #boxsize = 1 + points_padding
-    points_uniform = torch.rand(n_points_uniform, 3, device = 'cuda')
-    points_uniform = boxsize * (points_uniform - 0.5)
-    return points_uniform
-def pull_points (sdf_network, samples, alpha = 1.):
-    """
-    pull points towards the surface using the sdf of the network and it's gradient
-    """
-    gradients_sample = sdf_network.gradient(samples).squeeze() # 5000x3
-    sdf_sample = sdf_network.sdf(samples)                      # 5000x1
-    grad_norm = F.normalize(gradients_sample, dim=1)                # 5000x3
-    sample_moved = samples -alpha* grad_norm * sdf_sample
-    return sample_moved
-
-
-import torch
-from torch.autograd import grad
-def gradient(inputs, outputs):
-    d_points = torch.ones_like(outputs, requires_grad=False, device=outputs.device)
-    points_grad = grad(
-        outputs=outputs,
-        inputs=inputs,
-        grad_outputs=d_points,
-        create_graph=True,
-        retain_graph=True,
-        only_inputs=True)[0]
-    return points_grad
-def get_exp(args):
-    return f'{args.method}_p_{args.n_points}_sigma_{args.sigma}_rho_{args.rho}'
-
-import sys, os
-sys.path.append(os.path.abspath("../convolutional_occupancy_networks") )
-from src.eval import MeshEvaluator
-import pandas as pd
-evaluator = MeshEvaluator(n_points=100000)
-def eval_mesh(mesh,shapedata ):
-    """
-    computes evaluation metrics using the predicted mesh and uniform query points with gt occupancies.
-    params:
-    ------
-    mesh: predicted trimesh mesh
-    shapedata: dict containing gt normals,input pointcloud,  query points and their occupancy values
-    """
-    eval_dict_mesh = evaluator.eval_mesh(
-                        mesh, shapedata['pc'], shapedata['normals'], shapedata['points'], 
-                        shapedata['occ'], remove_wall=False)
-    return pd.DataFrame(eval_dict_mesh, index = {0})
-
-import torch
-import torch.nn as nn
-
-
+def compute_dists_flann(recon_points, gt_points):
+    recon_kd_tree = napf.KDT(tree_data=recon_points, metric=2) 
+    gt_kd_tree = napf.KDT(tree_data=gt_points, metric=2)
+    re2gt_distances, indices = recon_kd_tree.knn_search(
+                            queries=gt_points,
+                            kneighbors=1,
+                            nthread=50)
+    gt2re_distances, indices = gt_kd_tree.knn_search(
+                            queries=recon_points,
+                            kneighbors=1,
+                            nthread=50)
+    
+    re2gt_distances = np.sqrt(re2gt_distances)
+    gt2re_distances = np.sqrt(gt2re_distances)
+    cd_re2gt = np.mean(re2gt_distances)
+    cd_gt2re = np.mean(gt2re_distances)
+    hd_re2gt = np.max(re2gt_distances)
+    hd_gt2re = np.max(gt2re_distances)
+    chamfer_dist = 0.5* (cd_re2gt + cd_gt2re)
+    hausdorff_distance = np.max((hd_re2gt, hd_gt2re))
+    return chamfer_dist , hausdorff_distance
 
 
 def distance_p2p(points_src, normals_src, points_tgt, normals_tgt):
@@ -472,24 +504,3 @@ def eval_pointcloud(pointcloud, pointcloud_tgt,
         return out_dict
 
 
-class Scheduler:
-    def __init__(self, optimizer, maxiter, learning_rate, warm_up_end):
-        self.warm_up_end = warm_up_end
-        self.maxiter = maxiter
-        self.learning_rate = learning_rate
-        self.optimizer = optimizer
-    def get_lr(self, iter_step):
-        warn_up = self.warm_up_end
-        max_iter = self.maxiter
-        init_lr = self.learning_rate
-        lr =  (iter_step / warn_up) if iter_step < warn_up else 0.5 * (math.cos((iter_step - warn_up)/(max_iter - warn_up) * math.pi) + 1) 
-        lr = lr * init_lr
-        return lr
-    def update_learning_rate_np(self, iter_step):
-        warn_up = self.warm_up_end
-        max_iter = self.maxiter
-        init_lr = self.learning_rate
-        lr =  (iter_step / warn_up) if iter_step < warn_up else 0.5 * (math.cos((iter_step - warn_up)/(max_iter - warn_up) * math.pi) + 1) 
-        lr = lr * init_lr
-        for g in self.optimizer.param_groups:
-            g['lr'] = lr
