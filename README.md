@@ -1,5 +1,5 @@
 # Unsupervised Occupancy Learning from Sparse Point Cloud
-===========================================================
+
 
 This repository contains the implementation of the CVPR 2024 paper [Unsupervised Occupancy Learning from Sparse Point Cloud](https://arxiv.org/pdf/2404.02759)  by Amine Ouasfi and Adnane Boukhayma.
 
